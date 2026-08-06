@@ -33,23 +33,40 @@
         return (str || '').replace(/\s+/g, ' ').trim();
     }
 
-    // Page par se DMC results table dhoondo (header match kar ke)
+    // Ek table ka header check karo ke wo results table hai ya nahi
+    function tableMatches(table) {
+        const headerRow = table.querySelector('thead tr') || table.querySelector('tr');
+        if (!headerRow) return false;
+        const headerCells = Array.from(headerRow.querySelectorAll('th, td')).map(td => normalizeHeader(td.textContent));
+
+        const hasSemester = headerCells.some(h => h.includes('semester') && !h.includes('summary'));
+        const hasCH = headerCells.some(h => h === 'ch' || h.includes('credit'));
+        const hasGP = headerCells.some(h => h === 'gp' || h.includes('grade point'));
+
+        return hasSemester && hasCH && hasGP;
+    }
+
+    // Page par se DMC results table dhoondo (nested/wrapper tables ki wajah se
+    // sabse "andar wala" matching table choose karta hai, kyunke Odoo LMS
+    // page mein bade layout tables ke andar asal data table nested hoti hai)
     function findResultsTable() {
         const tables = Array.from(document.querySelectorAll('table'));
-        for (const table of tables) {
-            const headerRow = table.querySelector('thead tr') || table.querySelector('tr');
-            if (!headerRow) continue;
-            const headerCells = Array.from(headerRow.querySelectorAll('th, td')).map(td => normalizeHeader(td.textContent));
+        const candidates = tables.filter(tableMatches);
+        if (!candidates.length) return null;
 
-            const hasSemester = headerCells.some(h => h.includes('semester'));
-            const hasCH = headerCells.some(h => h === 'ch' || h.includes('credit'));
-            const hasGP = headerCells.some(h => h === 'gp' || h.includes('grade point'));
+        // Outer wrapper tables ko hata do (jo kisi doosre candidate table ko
+        // apne andar contain karte hain) — sirf innermost table rakho
+        const innermost = candidates.filter(
+            t => !candidates.some(other => other !== t && t.contains(other))
+        );
 
-            if (hasSemester && hasCH && hasGP) {
-                return table;
-            }
-        }
-        return null;
+        const pool = innermost.length ? innermost : candidates;
+
+        // Agar phir bhi ek se zyada bachein, sabse zyada rows wali table lo
+        // (asal data table mein sabse zyada subject rows hongi)
+        pool.sort((a, b) => b.querySelectorAll('tr').length - a.querySelectorAll('tr').length);
+
+        return pool[0];
     }
 
     // Header text se relevant columns ke index nikalo (dynamic - order kuch bhi ho chal jayega)
