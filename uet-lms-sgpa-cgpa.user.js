@@ -1,13 +1,15 @@
 // ==UserScript==
 // @name         UET LMS - SGPA & CGPA Auto Calculator
 // @namespace    https://lms.uet.edu.pk/
-// @version      1.0
-// @description  Student DMC page se data parh kar har semester ka SGPA aur running CGPA calculate karta hai, aur ek summary card show karta hai.
+// @version      2.0
+// @description  Student DMC page ke Course Result table ke andar, har semester khatam hone ke baad, ek line mein us semester ka SGPA aur us tak ka running CGPA dikhata hai.
 // @author       You
 // @match        https://lms.uet.edu.pk/*
 // @match        https://lms.uet.pk/*
 // @grant        none
 // @run-at       document-idle
+// @updateURL    https://raw.githubusercontent.com/abubakar7997218-wq/Gpa-Cgpa-Extension/main/uet-lms-sgpa-cgpa.user.js
+// @downloadURL  https://raw.githubusercontent.com/abubakar7997218-wq/Gpa-Cgpa-Extension/main/uet-lms-sgpa-cgpa.user.js
 // ==/UserScript==
 
 (function () {
@@ -16,7 +18,9 @@
     const CONFIG = {
         maxWaitMs: 20000,     // kitni der tak table dhoondhna hai (ms)
         pollInterval: 500,    // poll interval fallback (ms)
-        cardId: 'uet-sgpa-cgpa-summary-card'
+        injectedMarker: 'sgpaCgpaInjected',
+        colorConfirmed: '#dc2626',  // red - jab semester ke saare subjects "Confirmed" hon
+        colorPending: '#111827'     // black - jab semester abhi "Provisional"/ongoing ho
     };
 
     function log(...args) {
@@ -33,17 +37,27 @@
         return (str || '').replace(/\s+/g, ' ').trim();
     }
 
+    // Table ke andar asal column-header wali row dhoondo. Kabhi kabhi pehli
+    // row sirf ek title/caption hoti hai (jese "Course Result"), asal
+    // headers (Semester/CH/GP) neeche wali kisi row mein hote hain — is liye
+    // saari rows scan karte hain, sirf pehli nahi.
+    function findHeaderRow(table) {
+        const rows = Array.from(table.querySelectorAll('tr')).slice(0, 10); // shuru ki 10 rows kaafi hain
+        for (const row of rows) {
+            const cells = Array.from(row.querySelectorAll('th, td')).map(td => normalizeHeader(td.textContent));
+            const hasSemester = cells.some(h => h.includes('semester') && !h.includes('summary'));
+            const hasCH = cells.some(h => h === 'ch' || h.includes('credit'));
+            const hasGP = cells.some(h => h === 'gp' || h.includes('grade point'));
+            if (hasSemester && hasCH && hasGP) {
+                return row;
+            }
+        }
+        return null;
+    }
+
     // Ek table ka header check karo ke wo results table hai ya nahi
     function tableMatches(table) {
-        const headerRow = table.querySelector('thead tr') || table.querySelector('tr');
-        if (!headerRow) return false;
-        const headerCells = Array.from(headerRow.querySelectorAll('th, td')).map(td => normalizeHeader(td.textContent));
-
-        const hasSemester = headerCells.some(h => h.includes('semester') && !h.includes('summary'));
-        const hasCH = headerCells.some(h => h === 'ch' || h.includes('credit'));
-        const hasGP = headerCells.some(h => h === 'gp' || h.includes('grade point'));
-
-        return hasSemester && hasCH && hasGP;
+        return findHeaderRow(table) !== null;
     }
 
     // Page par se DMC results table dhoondo (nested/wrapper tables ki wajah se
@@ -63,7 +77,6 @@
         const pool = innermost.length ? innermost : candidates;
 
         // Agar phir bhi ek se zyada bachein, sabse zyada rows wali table lo
-        // (asal data table mein sabse zyada subject rows hongi)
         pool.sort((a, b) => b.querySelectorAll('tr').length - a.querySelectorAll('tr').length);
 
         return pool[0];
@@ -71,7 +84,8 @@
 
     // Header text se relevant columns ke index nikalo (dynamic - order kuch bhi ho chal jayega)
     function getColumnIndices(table) {
-        const headerRow = table.querySelector('thead tr') || table.querySelector('tr');
+        const headerRow = findHeaderRow(table);
+        if (!headerRow) return null;
         const headerCells = Array.from(headerRow.querySelectorAll('th, td')).map(td => normalizeHeader(td.textContent));
 
         const findIndex = (predicates) => {
@@ -84,6 +98,8 @@
         };
 
         return {
+            headerRow,
+            columnCount: headerCells.length,
             semesterIdx: findIndex([h => h.includes('semester')]),
             chIdx: findIndex([h => h === 'ch', h => h.includes('credit')]),
             gpIdx: findIndex([h => h === 'gp', h => h.includes('grade point')]),
@@ -98,129 +114,90 @@
         return isNaN(n) ? null : n;
     }
 
-    // Table ki har row parh kar semester-wise CH/GP jama karo
-    function extractData(table, cols) {
+    // Ek semester-summary row banao aur di gayi row ke turant baad insert karo
+    function insertSummaryRow(afterRow, columnCount, semesterName, sgpa, cgpa, allConfirmed) {
+        const tr = document.createElement('tr');
+        tr.className = 'uet-sgpa-cgpa-summary-row';
+
+        const td = document.createElement('td');
+        td.colSpan = columnCount;
+        td.style.cssText = `
+            padding: 8px 10px;
+            background: #f1f5f9;
+            border-top: 1px solid #cbd5e1;
+            border-bottom: 1px solid #cbd5e1;
+            font-weight: 700;
+            font-size: 13px;
+        `;
+
+        const color = allConfirmed ? CONFIG.colorConfirmed : CONFIG.colorPending;
+        td.innerHTML = `<span style="color:${color};">${semesterName} &nbsp;—&nbsp; SGPA: ${sgpa} &nbsp;|&nbsp; CGPA: ${cgpa}</span>`;
+
+        tr.appendChild(td);
+        afterRow.parentNode.insertBefore(tr, afterRow.nextSibling);
+    }
+
+    // Table ki data rows ko semester-wise process karke, har semester ke
+    // aakhri subject row ke turant baad ek summary row insert karta hai
+    function injectInlineSummaries(table, cols) {
         const bodyRows = Array.from(table.querySelectorAll('tbody tr'));
-        const rows = bodyRows.length ? bodyRows : Array.from(table.querySelectorAll('tr')).slice(1);
+        const allRows = bodyRows.length ? bodyRows : Array.from(table.querySelectorAll('tr')).slice(1);
+        const dataRows = allRows.filter(row => row !== cols.headerRow);
 
-        const semesters = [];       // order jis tarah semester pehli baar mila
-        const semesterData = {};    // name -> { ch, gp, count }
+        let blockCH = 0, blockGP = 0;
+        let cumCH = 0, cumGP = 0;
+        let currentSemester = null;
+        let blockStatuses = [];
+        let lastRowOfBlock = null;
+        let semestersProcessed = 0;
 
-        rows.forEach(row => {
+        dataRows.forEach(row => {
             const cells = Array.from(row.querySelectorAll('td'));
             if (!cells.length) return;
 
             const semesterName = normalizeText(cells[cols.semesterIdx]?.textContent);
             const ch = parseNumber(cells[cols.chIdx]?.textContent);
             const gp = parseNumber(cells[cols.gpIdx]?.textContent);
+            const status = cols.statusIdx !== -1 ? normalizeText(cells[cols.statusIdx]?.textContent) : '';
 
-            // Agar semester name, CH ya GP na mile to row skip (junk/merged rows)
+            // Invalid/junk row (jese blank spacer row) - skip karo
             if (!semesterName || ch === null || gp === null) return;
 
-            if (!semesterData[semesterName]) {
-                semesterData[semesterName] = { ch: 0, gp: 0, count: 0 };
-                semesters.push(semesterName);
+            if (currentSemester === null) {
+                currentSemester = semesterName;
+            } else if (semesterName !== currentSemester) {
+                // Pichla semester khatam ho gaya - uski summary row insert karo
+                const sgpa = blockCH > 0 ? (blockGP / blockCH).toFixed(2) : '0.00';
+                const cgpa = cumCH > 0 ? (cumGP / cumCH).toFixed(2) : '0.00';
+                const allConfirmed = blockStatuses.length > 0 && blockStatuses.every(s => s.toLowerCase() === 'confirmed');
+                insertSummaryRow(lastRowOfBlock, cols.columnCount, currentSemester, sgpa, cgpa, allConfirmed);
+                semestersProcessed++;
+
+                // Naye semester ke liye reset
+                blockCH = 0;
+                blockGP = 0;
+                blockStatuses = [];
+                currentSemester = semesterName;
             }
 
-            semesterData[semesterName].ch += ch;
-            semesterData[semesterName].gp += gp;
-            semesterData[semesterName].count += 1;
-        });
-
-        return { semesters, semesterData };
-    }
-
-    // Har semester ka SGPA + us tak running CGPA nikalo
-    function computeResults(semesters, semesterData) {
-        let cumCH = 0;
-        let cumGP = 0;
-        const results = [];
-
-        semesters.forEach(sem => {
-            const { ch, gp } = semesterData[sem];
-            const sgpa = ch > 0 ? (gp / ch) : 0;
-
+            blockCH += ch;
+            blockGP += gp;
             cumCH += ch;
             cumGP += gp;
-            const cgpa = cumCH > 0 ? (cumGP / cumCH) : 0;
-
-            results.push({
-                semester: sem,
-                sgpa: sgpa.toFixed(2),
-                cgpa: cgpa.toFixed(2),
-                ch,
-                gp: gp.toFixed(2)
-            });
+            blockStatuses.push(status);
+            lastRowOfBlock = row;
         });
 
-        return {
-            results,
-            overallCGPA: cumCH > 0 ? (cumGP / cumCH).toFixed(2) : '0.00',
-            totalCH: cumCH
-        };
-    }
+        // Aakhri semester ki summary bhi insert karo
+        if (currentSemester !== null && lastRowOfBlock) {
+            const sgpa = blockCH > 0 ? (blockGP / blockCH).toFixed(2) : '0.00';
+            const cgpa = cumCH > 0 ? (cumGP / cumCH).toFixed(2) : '0.00';
+            const allConfirmed = blockStatuses.length > 0 && blockStatuses.every(s => s.toLowerCase() === 'confirmed');
+            insertSummaryRow(lastRowOfBlock, cols.columnCount, currentSemester, sgpa, cgpa, allConfirmed);
+            semestersProcessed++;
+        }
 
-    function buildCard(data) {
-        const existing = document.getElementById(CONFIG.cardId);
-        if (existing) existing.remove();
-
-        const card = document.createElement('div');
-        card.id = CONFIG.cardId;
-        card.style.cssText = `
-            font-family: 'Segoe UI', Roboto, Arial, sans-serif;
-            background: linear-gradient(135deg, #1f2937, #111827);
-            color: #f3f4f6;
-            border: 1px solid #374151;
-            border-radius: 12px;
-            padding: 18px 20px;
-            margin: 16px 0;
-            box-shadow: 0 4px 14px rgba(0,0,0,0.35);
-            max-width: 700px;
-        `;
-
-        let html = `
-            <div style="display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;">
-                <h2 style="margin:0; font-size:18px; color:#facc15;">📊 SGPA / CGPA Summary</h2>
-                <span style="font-size:12px; color:#9ca3af;">Auto-calculated</span>
-            </div>
-            <table style="width:100%; border-collapse:collapse; font-size:14px;">
-                <thead>
-                    <tr style="text-align:left; border-bottom:1px solid #374151;">
-                        <th style="padding:6px 4px;">Semester</th>
-                        <th style="padding:6px 4px;">CH</th>
-                        <th style="padding:6px 4px;">SGPA</th>
-                        <th style="padding:6px 4px;">CGPA</th>
-                    </tr>
-                </thead>
-                <tbody>
-        `;
-
-        data.results.forEach(r => {
-            html += `
-                <tr style="border-bottom:1px solid #27303f;">
-                    <td style="padding:6px 4px; font-weight:600; color:#93c5fd;">${r.semester}</td>
-                    <td style="padding:6px 4px;">${r.ch}</td>
-                    <td style="padding:6px 4px; color:#34d399; font-weight:600;">${r.sgpa}</td>
-                    <td style="padding:6px 4px; color:#fbbf24; font-weight:600;">${r.cgpa}</td>
-                </tr>
-            `;
-        });
-
-        html += `
-                </tbody>
-            </table>
-            <div style="margin-top:14px; padding-top:12px; border-top:1px solid #374151; display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px;">
-                <span style="font-size:14px; color:#d1d5db;">Total Credit Hours: <b>${data.totalCH}</b></span>
-                <span style="font-size:16px; color:#facc15; font-weight:bold;">Overall CGPA: ${data.overallCGPA}</span>
-            </div>
-        `;
-
-        card.innerHTML = html;
-        return card;
-    }
-
-    function insertCard(table, card) {
-        table.parentNode.insertBefore(card, table);
+        return semestersProcessed;
     }
 
     function run() {
@@ -230,22 +207,25 @@
             return false;
         }
 
+        // Agar is table mein pehle hi summary rows daal chuke hain, dobara mat daalo
+        if (table.dataset[CONFIG.injectedMarker] === 'true') {
+            return true;
+        }
+
         const cols = getColumnIndices(table);
-        if (cols.semesterIdx === -1 || cols.chIdx === -1 || cols.gpIdx === -1) {
+        if (!cols || cols.semesterIdx === -1 || cols.chIdx === -1 || cols.gpIdx === -1) {
             log('Zaroori columns (Semester/CH/GP) table mein nahi milay.');
             return false;
         }
 
-        const { semesters, semesterData } = extractData(table, cols);
-        if (!semesters.length) {
+        const count = injectInlineSummaries(table, cols);
+        if (count === 0) {
             log('Abhi koi valid row parse nahi hui.');
             return false;
         }
 
-        const data = computeResults(semesters, semesterData);
-        const card = buildCard(data);
-        insertCard(table, card);
-        log('Summary card inject ho gaya.', data);
+        table.dataset[CONFIG.injectedMarker] = 'true';
+        log(`${count} semester summary row(s) inject ho gayin.`);
         return true;
     }
 
