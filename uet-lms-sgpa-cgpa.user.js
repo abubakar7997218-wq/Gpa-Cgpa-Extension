@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         UET LMS - SGPA & CGPA Auto Calculator
 // @namespace    https://lms.uet.edu.pk/
-// @version      2.0
-// @description  Student DMC page ke Course Result table ke andar, har semester khatam hone ke baad, ek line mein us semester ka SGPA aur us tak ka running CGPA dikhata hai.
+// @version      3.0
+// @description  Student DMC page ke Course Result table ko semester-wise group karke, har semester ke baad SGPA/CGPA ki line dikhata hai. "Show Semester Summary" jaisi buttons se table shuffle ho jaye to bhi khud theek kar deta hai.
 // @author       You
 // @match        https://lms.uet.edu.pk/*
 // @match        https://lms.uet.pk/*
@@ -16,34 +16,40 @@
     'use strict';
 
     const CONFIG = {
-        maxWaitMs: 20000,     // kitni der tak table dhoondhna hai (ms)
-        pollInterval: 500,    // poll interval fallback (ms)
-        injectedMarker: 'sgpaCgpaInjected',
-        colorConfirmed: '#dc2626',  // red - jab semester ke saare subjects "Confirmed" hon
-        colorPending: '#111827'     // black - jab semester abhi "Provisional"/ongoing ho
+        debounceMs: 350,           // DOM change ke baad kitna wait kar ke reprocess karein
+        maxInitialWaitMs: 20000,   // shuru mein table dhoondhne ki max koshish (ms)
+        summaryRowClass: 'uet-sgpa-cgpa-summary-row',
+        colorConfirmed: '#dc2626', // red - jab semester ke saare subjects "Confirmed" hon
+        colorPending: '#111827'    // black - jab semester abhi "Provisional"/ongoing ho
     };
+
+    let lastSignature = null;
+    let debounceTimer = null;
+    let isProcessing = false;
 
     function log(...args) {
         console.log('[UET SGPA/CGPA]', ...args);
     }
 
-    // Header text ko compare karne ke liye normalize
     function normalizeHeader(str) {
         return (str || '').replace(/\s+/g, ' ').trim().toLowerCase();
     }
 
-    // Cell text ke liye normalize (case preserve)
     function normalizeText(str) {
         return (str || '').replace(/\s+/g, ' ').trim();
     }
 
-    // Table ke andar asal column-header wali row dhoondo. Kabhi kabhi pehli
-    // row sirf ek title/caption hoti hai (jese "Course Result"), asal
-    // headers (Semester/CH/GP) neeche wali kisi row mein hote hain — is liye
-    // saari rows scan karte hain, sirf pehli nahi.
+    function parseNumber(text) {
+        const n = parseFloat((text || '').replace(/[^\d.\-]/g, ''));
+        return isNaN(n) ? null : n;
+    }
+
+    // Table ke andar asal column-header wali row dhoondo (humari khud ki
+    // summary rows ko ignore karte hue, warna wo bhi galti se header ban sakti hain)
     function findHeaderRow(table) {
-        const rows = Array.from(table.querySelectorAll('tr')).slice(0, 10); // shuru ki 10 rows kaafi hain
+        const rows = Array.from(table.querySelectorAll('tr')).slice(0, 10);
         for (const row of rows) {
+            if (row.classList.contains(CONFIG.summaryRowClass)) continue;
             const cells = Array.from(row.querySelectorAll('th, td')).map(td => normalizeHeader(td.textContent));
             const hasSemester = cells.some(h => h.includes('semester') && !h.includes('summary'));
             const hasCH = cells.some(h => h === 'ch' || h.includes('credit'));
@@ -55,34 +61,26 @@
         return null;
     }
 
-    // Ek table ka header check karo ke wo results table hai ya nahi
     function tableMatches(table) {
         return findHeaderRow(table) !== null;
     }
 
-    // Page par se DMC results table dhoondo (nested/wrapper tables ki wajah se
-    // sabse "andar wala" matching table choose karta hai, kyunke Odoo LMS
-    // page mein bade layout tables ke andar asal data table nested hoti hai)
+    // Nested/wrapper tables ki wajah se sabse "andar wala" matching table dhoondo
     function findResultsTable() {
         const tables = Array.from(document.querySelectorAll('table'));
         const candidates = tables.filter(tableMatches);
         if (!candidates.length) return null;
 
-        // Outer wrapper tables ko hata do (jo kisi doosre candidate table ko
-        // apne andar contain karte hain) — sirf innermost table rakho
         const innermost = candidates.filter(
             t => !candidates.some(other => other !== t && t.contains(other))
         );
 
         const pool = innermost.length ? innermost : candidates;
-
-        // Agar phir bhi ek se zyada bachein, sabse zyada rows wali table lo
         pool.sort((a, b) => b.querySelectorAll('tr').length - a.querySelectorAll('tr').length);
 
         return pool[0];
     }
 
-    // Header text se relevant columns ke index nikalo (dynamic - order kuch bhi ho chal jayega)
     function getColumnIndices(table) {
         const headerRow = findHeaderRow(table);
         if (!headerRow) return null;
@@ -103,21 +101,45 @@
             semesterIdx: findIndex([h => h.includes('semester')]),
             chIdx: findIndex([h => h === 'ch', h => h.includes('credit')]),
             gpIdx: findIndex([h => h === 'gp', h => h.includes('grade point')]),
-            subjectIdx: findIndex([h => h.includes('subject'), h => h.includes('course')]),
-            gradeIdx: findIndex([h => h === 'grade']),
             statusIdx: findIndex([h => h.includes('status')])
         };
     }
 
-    function parseNumber(text) {
-        const n = parseFloat((text || '').replace(/[^\d.\-]/g, ''));
-        return isNaN(n) ? null : n;
+    // Table ki saari (valid) data rows nikalo, apni khud ki summary rows aur
+    // header row ko chhod kar
+    function getDataRows(table, cols) {
+        const bodyRows = Array.from(table.querySelectorAll('tbody tr'));
+        const allRows = bodyRows.length ? bodyRows : Array.from(table.querySelectorAll('tr')).slice(1);
+        return allRows.filter(row => row !== cols.headerRow && !row.classList.contains(CONFIG.summaryRowClass));
     }
 
-    // Ek semester-summary row banao aur di gayi row ke turant baad insert karo
+    // Har row se semester/ch/gp/status parh kar { row, semesterName, ch, gp, status } return karo
+    // Invalid/junk rows (jese blank spacer row) ke liye null
+    function parseRow(row, cols) {
+        const cells = Array.from(row.querySelectorAll('td'));
+        if (!cells.length) return null;
+
+        const semesterName = normalizeText(cells[cols.semesterIdx]?.textContent);
+        const ch = parseNumber(cells[cols.chIdx]?.textContent);
+        const gp = parseNumber(cells[cols.gpIdx]?.textContent);
+        const status = cols.statusIdx !== -1 ? normalizeText(cells[cols.statusIdx]?.textContent) : '';
+
+        if (!semesterName || ch === null || gp === null) return null;
+        return { row, semesterName, ch, gp, status };
+    }
+
+    // Order-independent "signature" banata hai taake pata chal sake ke asal
+    // mein data change hua hai ya sirf order shuffle hui hai
+    function buildSignature(entries) {
+        return entries
+            .map(e => `${e.semesterName}|${e.ch}|${e.gp}|${e.status}`)
+            .sort()
+            .join(';');
+    }
+
     function insertSummaryRow(afterRow, columnCount, semesterName, sgpa, cgpa, allConfirmed) {
         const tr = document.createElement('tr');
-        tr.className = 'uet-sgpa-cgpa-summary-row';
+        tr.className = CONFIG.summaryRowClass;
 
         const td = document.createElement('td');
         td.colSpan = columnCount;
@@ -137,117 +159,121 @@
         afterRow.parentNode.insertBefore(tr, afterRow.nextSibling);
     }
 
-    // Table ki data rows ko semester-wise process karke, har semester ke
-    // aakhri subject row ke turant baad ek summary row insert karta hai
-    function injectInlineSummaries(table, cols) {
-        const bodyRows = Array.from(table.querySelectorAll('tbody tr'));
-        const allRows = bodyRows.length ? bodyRows : Array.from(table.querySelectorAll('tr')).slice(1);
-        const dataRows = allRows.filter(row => row !== cols.headerRow);
+    // Rows ko semester-wise group karke, table ke andar physically wapis
+    // tarteeb (group) mein laga deta hai (chahe original order mixed ho),
+    // phir har group ke baad summary row insert karta hai
+    function regroupAndInject(table, cols, entries) {
+        // Purani summary rows hata do (fresh insert karenge)
+        table.querySelectorAll('.' + CONFIG.summaryRowClass).forEach(r => r.remove());
 
-        let blockCH = 0, blockGP = 0;
-        let cumCH = 0, cumGP = 0;
-        let currentSemester = null;
-        let blockStatuses = [];
-        let lastRowOfBlock = null;
-        let semestersProcessed = 0;
+        const semesterOrder = [];
+        const groups = new Map();
 
-        dataRows.forEach(row => {
-            const cells = Array.from(row.querySelectorAll('td'));
-            if (!cells.length) return;
-
-            const semesterName = normalizeText(cells[cols.semesterIdx]?.textContent);
-            const ch = parseNumber(cells[cols.chIdx]?.textContent);
-            const gp = parseNumber(cells[cols.gpIdx]?.textContent);
-            const status = cols.statusIdx !== -1 ? normalizeText(cells[cols.statusIdx]?.textContent) : '';
-
-            // Invalid/junk row (jese blank spacer row) - skip karo
-            if (!semesterName || ch === null || gp === null) return;
-
-            if (currentSemester === null) {
-                currentSemester = semesterName;
-            } else if (semesterName !== currentSemester) {
-                // Pichla semester khatam ho gaya - uski summary row insert karo
-                const sgpa = blockCH > 0 ? (blockGP / blockCH).toFixed(2) : '0.00';
-                const cgpa = cumCH > 0 ? (cumGP / cumCH).toFixed(2) : '0.00';
-                const allConfirmed = blockStatuses.length > 0 && blockStatuses.every(s => s.toLowerCase() === 'confirmed');
-                insertSummaryRow(lastRowOfBlock, cols.columnCount, currentSemester, sgpa, cgpa, allConfirmed);
-                semestersProcessed++;
-
-                // Naye semester ke liye reset
-                blockCH = 0;
-                blockGP = 0;
-                blockStatuses = [];
-                currentSemester = semesterName;
+        entries.forEach(e => {
+            if (!groups.has(e.semesterName)) {
+                groups.set(e.semesterName, { rows: [], ch: 0, gp: 0, statuses: [] });
+                semesterOrder.push(e.semesterName);
             }
-
-            blockCH += ch;
-            blockGP += gp;
-            cumCH += ch;
-            cumGP += gp;
-            blockStatuses.push(status);
-            lastRowOfBlock = row;
+            const g = groups.get(e.semesterName);
+            g.rows.push(e.row);
+            g.ch += e.ch;
+            g.gp += e.gp;
+            g.statuses.push(e.status);
         });
 
-        // Aakhri semester ki summary bhi insert karo
-        if (currentSemester !== null && lastRowOfBlock) {
-            const sgpa = blockCH > 0 ? (blockGP / blockCH).toFixed(2) : '0.00';
-            const cgpa = cumCH > 0 ? (cumGP / cumCH).toFixed(2) : '0.00';
-            const allConfirmed = blockStatuses.length > 0 && blockStatuses.every(s => s.toLowerCase() === 'confirmed');
-            insertSummaryRow(lastRowOfBlock, cols.columnCount, currentSemester, sgpa, cgpa, allConfirmed);
-            semestersProcessed++;
-        }
+        if (!semesterOrder.length) return 0;
 
-        return semestersProcessed;
+        // Ek marker (comment node) pehli data-row ki jagah pe rakho, phir har
+        // group ki rows ko tarteeb se usi marker se pehle move kar do
+        const firstRow = groups.get(semesterOrder[0]).rows[0];
+        const parent = firstRow.parentNode;
+        const marker = document.createComment('uet-sgpa-cgpa-anchor');
+        parent.insertBefore(marker, firstRow);
+
+        let cumCH = 0, cumGP = 0;
+
+        semesterOrder.forEach(semName => {
+            const g = groups.get(semName);
+            g.rows.forEach(r => parent.insertBefore(r, marker));
+
+            cumCH += g.ch;
+            cumGP += g.gp;
+
+            const sgpa = g.ch > 0 ? (g.gp / g.ch).toFixed(2) : '0.00';
+            const cgpa = cumCH > 0 ? (cumGP / cumCH).toFixed(2) : '0.00';
+            const allConfirmed = g.statuses.length > 0 && g.statuses.every(s => s.toLowerCase() === 'confirmed');
+
+            const lastRow = g.rows[g.rows.length - 1];
+            insertSummaryRow(lastRow, cols.columnCount, semName, sgpa, cgpa, allConfirmed);
+        });
+
+        parent.removeChild(marker);
+
+        return semesterOrder.length;
     }
 
-    function run() {
+    function runOnce() {
         const table = findResultsTable();
         if (!table) {
             log('Results table abhi nahi mila.');
-            return false;
-        }
-
-        // Agar is table mein pehle hi summary rows daal chuke hain, dobara mat daalo
-        if (table.dataset[CONFIG.injectedMarker] === 'true') {
-            return true;
+            return;
         }
 
         const cols = getColumnIndices(table);
         if (!cols || cols.semesterIdx === -1 || cols.chIdx === -1 || cols.gpIdx === -1) {
             log('Zaroori columns (Semester/CH/GP) table mein nahi milay.');
-            return false;
+            return;
         }
 
-        const count = injectInlineSummaries(table, cols);
-        if (count === 0) {
+        const dataRows = getDataRows(table, cols);
+        const entries = dataRows.map(row => parseRow(row, cols)).filter(Boolean);
+        if (!entries.length) {
             log('Abhi koi valid row parse nahi hui.');
-            return false;
+            return;
         }
 
-        table.dataset[CONFIG.injectedMarker] = 'true';
-        log(`${count} semester summary row(s) inject ho gayin.`);
-        return true;
+        const signature = buildSignature(entries);
+        const summaryRowsPresent = table.querySelectorAll('.' + CONFIG.summaryRowClass).length > 0;
+
+        // Agar data pehle jaisa hi hai AUR summary rows already lagi hui hain, kuch mat karo
+        if (signature === lastSignature && summaryRowsPresent) {
+            return;
+        }
+
+        const count = regroupAndInject(table, cols, entries);
+        lastSignature = signature;
+        log(`${count} semester summary row(s) inject/update ho gayin.`);
     }
 
-    // Pehle turant try karo, phir DOM changes observe karo, aur timeout tak poll bhi karo
-    let done = run();
-
-    if (!done) {
-        const observer = new MutationObserver(() => {
-            if (done) return;
-            done = run();
-            if (done) observer.disconnect();
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
-
-        const startTime = Date.now();
-        const poll = setInterval(() => {
-            if (done || Date.now() - startTime > CONFIG.maxWaitMs) {
-                clearInterval(poll);
-                observer.disconnect();
-                return;
+    function scheduleRun() {
+        if (isProcessing) return;
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(() => {
+            isProcessing = true;
+            try {
+                runOnce();
+            } finally {
+                isProcessing = false;
             }
-            done = run();
-        }, CONFIG.pollInterval);
+        }, CONFIG.debounceMs);
     }
+
+    // Shuru mein turant try karo
+    scheduleRun();
+
+    // Har DOM change pe (jese "Show Semester Summary" click, tab switch,
+    // AJAX refresh) dobara check karo aur zaroorat ho to theek kar do
+    const observer = new MutationObserver(() => scheduleRun());
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    // Safety net: shuru ke 20 second tak thora poll bhi karte raho, taake
+    // agar koi mutation miss ho jaye to bhi table mil jaye
+    const startTime = Date.now();
+    const poll = setInterval(() => {
+        if (Date.now() - startTime > CONFIG.maxInitialWaitMs) {
+            clearInterval(poll);
+            return;
+        }
+        scheduleRun();
+    }, 1000);
 })();
